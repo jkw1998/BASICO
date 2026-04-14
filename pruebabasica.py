@@ -1,85 +1,71 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from sklearn.neural_network import MLPRegressor
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
 
-# --- PARÁMETROS CAPÍTULO 8 ---
-CAPACIDAD_MAX = 50.0
-P_MAX_CARGA = 15.0
-P_MAX_DESCARGA = 15.0
-EFICIENCIA = 0.9
-SOC_INICIAL = 25.0
+# --- PASO 1: DATOS DEL LIBRO (VPP Ejemplo Cap 8) ---
+CAP_MAX = 50.0      # Capacidad batería (MWh)
+P_MAX = 15.0        # Potencia máx (MW)
+EFICIENCIA = 0.9    # η (90%)
+SOC_INI = 25.0      # Estado inicial
 
-# --- EL OPTIMIZADOR (MAESTRO) ---
-def optimizador_vpp_cap8(demanda, renovable):
+# --- PASO 2: EL OPTIMIZADOR (Referencia matemática) ---
+def resolver_ejemplo_libro(demanda, renovable):
     n = len(demanda)
-    demanda_neta = demanda - renovable
-    bounds = [(-P_MAX_DESCARGA, P_MAX_CARGA) for _ in range(n)]
-
-    def objetivo(x):
-        return np.sum((demanda_neta + x)**2)
-
-    def restriccion_soc(x):
-        soc = np.zeros(n + 1)
-        soc[0] = SOC_INICIAL
-        penalizacion = 0
-        for t in range(n):
-            if x[t] >= 0: soc[t+1] = soc[t] + (x[t] * EFICIENCIA)
-            else: soc[t+1] = soc[t] + (x[t] / EFICIENCIA)
-            if soc[t+1] < 0: penalizacion += abs(soc[t+1])
-            elif soc[t+1] > CAPACIDAD_MAX: penalizacion += (soc[t+1] - CAPACIDAD_MAX)
-        return penalizacion
-
-    res = minimize(objetivo, np.zeros(n), method='SLSQP', bounds=bounds, 
-                   constraints={'type': 'eq', 'fun': restriccion_soc})
+    dem_neta = demanda - renovable
     
-    soc_evol = []
-    curr = SOC_INICIAL
-    for val in res.x:
-        if val >= 0: curr += (val * EFICIENCIA)
-        else: curr += (val / EFICIENCIA)
-        soc_evol.append(curr)
-    return soc_evol
+    # Objetivo: Minimizar el desajuste (Balance de la VPP)
+    def obj(x): return np.sum((dem_neta + x)**2)
 
-# --- GENERACIÓN DE DATOS ---
-print("Generando datos...")
+    # Restricciones de la sección 8.2.3
+    def const_soc(x):
+        soc = SOC_INI
+        for val in x:
+            if val >= 0: soc += val * EFICIENCIA
+            else: soc += val / EFICIENCIA
+            if soc < 0 or soc > CAP_MAX: return -1 # Castigo si rompe límites
+        return 0
+
+    res = minimize(obj, np.zeros(n), bounds=[(-P_MAX, P_MAX)]*n)
+    
+    # Calcular evolución del almacenamiento
+    soc_list = []
+    s = SOC_INI
+    for v in res.x:
+        if v >= 0: s += v * EFICIENCIA
+        else: s += v / EFICIENCIA
+        soc_list.append(s)
+    return soc_list
+
+# --- PASO 3: GENERAR DATASET Y ENTRENAR LA RED ---
+print("1. Resolviendo ejemplo del libro para crear datos...")
 datos = []
-for dia in range(200):
-    base = np.array([30,25,20,20,25,35,50,60,70,75,80,75,70,65,70,80,90,100,95,85,70,55,45,35])
-    demanda = base + np.random.normal(0, 5, 24)
-    renov = np.random.uniform(5, 55, 24)
-    niveles = optimizador_vpp_cap8(demanda, renov)
+for _ in range(100): # 100 días de práctica
+    d = np.random.normal(60, 10, 24) # Demanda
+    r = np.random.normal(40, 15, 24) # Renovable
+    soc_optimo = resolver_ejemplo_libro(d, r)
     for h in range(24):
-        datos.append({'d': demanda[h], 'r': renov[h], 'sp': niveles[h-1] if h>0 else SOC_INICIAL, 'target': niveles[h]})
+        datos.append({'dem': d[h], 'ren': r[h], 'soc_ant': soc_optimo[h-1] if h>0 else SOC_INI, 'target': soc_optimo[h]})
 
 df = pd.DataFrame(datos)
-
-# --- RED NEURONAL (CON SCIKIT-LEARN) ---
-X = df[['d', 'r', 'sp']].values
-y = df['target'].values
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
-
 scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+X = scaler.fit_transform(df[['dem', 'ren', 'soc_ant']])
+y = df['target']
 
-print("Entrenando Red Neuronal (MLP)...")
-# Creamos la red con 2 capas ocultas (64 y 32 neuronas)
-regr = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500, activation='relu', solver='adam')
-regr.fit(X_train_scaled, y_train)
+print("2. Entrenando la Red Neuronal para que aprenda la solución óptima...")
+# Esta es la Red Neuronal (MLP = Multi-Layer Perceptron)
+red_neuronal = MLPRegressor(hidden_layer_sizes=(50, 50), max_iter=500)
+red_neuronal.fit(X, y)
 
-# --- RESULTADOS ---
-score = regr.score(X_test_scaled, y_test)
-print(f"Precisión del modelo (R2): {score:.4f}")
+# --- PASO 4: RESULTADOS PARA MOSTRAR AL TUTOR ---
+print("\n--- INFORME PARA EL TUTOR ---")
+test_input = scaler.transform([[80, 10, 25]]) # Caso: Demanda 80, Renovable 10, SOC 25
+pred = red_neuronal.predict(test_input)
+print(f"Resultado: Ante falta de energía, la Red predice un SOC de {pred[0]:.2f} MWh")
 
-# Prueba
-test_in = scaler.transform([[80, 15, 20]])
-pred = regr.predict(test_in)
-print(f"Predicción para Demanda=80, Renov=15, SOC_prev=20: {pred[0]:.2f} MWh")
-
-plt.plot(regr.loss_curve_)
-plt.title("Curva de Aprendizaje")
+plt.plot(red_neuronal.loss_curve_)
+plt.title("Curva de Aprendizaje de la Red (Debería bajar)")
+plt.ylabel("Error"); plt.xlabel("Iteraciones")
 plt.show()
