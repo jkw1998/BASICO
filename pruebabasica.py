@@ -3,134 +3,142 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
+import warnings
 
 # ==========================================
-# 1. PARÁMETROS TÉCNICOS (CAPÍTULO 8)
+# 1. PARÁMETROS DEL CASO DE ESTUDIO
 # ==========================================
 CAPACIDAD_MAX = 50.0  # MWh
-P_MAX_BAT = 15.0      # MW (Carga/Descarga)
-EFICIENCIA = 0.9      # n (90%)
-SOC_INICIAL = 25.0    # MWh (Punto de partida)
+P_MAX_BAT = 20.0      # MW
+EFICIENCIA = 0.95     
+SOC_INICIAL = 25.0    
 
-# ==========================================
-# 2. OPTIMIZADOR DE REFERENCIA (BASADO EN EL LIBRO)
-# ==========================================
-def calcular_soc_optimo(demanda, renovable, soc_inicio):
-    """
-    Resuelve la operación del almacenamiento para 24h siguiendo
-    las restricciones de las secciones 8.2 y 8.3.
-    """
+def optimizador_maestro(demanda, renovable, soc_inicio):
+    """ Genera la solución ideal que la IA debe aprender """
     n = len(demanda)
-    demanda_neta = demanda - renovable
-    
-    # Función objetivo: Minimizar el desbalance de la VPP
-    def objetivo(x):
-        return np.sum((demanda_neta + x)**2)
-
-    # Restricción de evolución del SOC (Ecuación 8.16 y 8.17)
-    def restriccion_fisica(x):
-        soc_temporal = soc_inicio
-        for t in range(n):
-            if x[t] >= 0: # Carga
-                soc_temporal += x[t] * EFICIENCIA
-            else:         # Descarga
-                soc_temporal += x[t] / EFICIENCIA
-            
-            # Si el SOC sale de límites, devolvemos un valor de error
-            if soc_temporal < 0 or soc_temporal > CAPACIDAD_MAX:
-                return -1 
+    d_neta = demanda - renovable
+    def objetivo(x): return np.sum((d_neta + x)**2)
+    def restriccion(x):
+        s = soc_inicio
+        for v in x:
+            if v >= 0: s += v * EFICIENCIA
+            else: s += v / EFICIENCIA
+            if s < 0 or s > CAPACIDAD_MAX: return -100
         return 0
-
-    # Límites de potencia (Ecuación 8.18)
-    bounds = [(-P_MAX_BAT, P_MAX_BAT)] * n
-    
-    res = minimize(objetivo, np.zeros(n), bounds=bounds, 
-                   constraints={'type': 'eq', 'fun': restriccion_fisica})
-    
-    # Reconstruir la serie de SOC resultante
-    soc_evolucion = []
-    s = soc_inicio
+    res = minimize(objetivo, np.zeros(n), bounds=[(-P_MAX_BAT, P_MAX_BAT)] * n,
+                   constraints={'type': 'eq', 'fun': restriccion})
+    soc_evol = []
+    curr_s = soc_inicio
     for v in res.x:
-        if v >= 0: s += v * EFICIENCIA
-        else: s += v / EFICIENCIA
-        soc_evolucion.append(s)
-        
-    return res.x, soc_evolucion
+        if v >= 0: curr_s += v * EFICIENCIA
+        else: curr_s += v / EFICIENCIA
+        soc_evol.append(curr_s)
+    return soc_evol
 
 # ==========================================
-# 3. GENERACIÓN DE DATASET DE ENTRENAMIENTO
+# 2. GENERACIÓN DE DATOS Y ENTRENAMIENTO
 # ==========================================
-print("Generando datos de entrenamiento...")
-datos_historicos = []
-num_dias_entrenamiento = 100
-
-for _ in range(num_dias_entrenamiento):
-    # Generar perfiles aleatorios de demanda y renovable
-    d = np.random.normal(60, 10, 24)
-    r = np.random.normal(40, 15, 24)
-    _, soc_opt = calcular_soc_optimo(d, r, SOC_INICIAL)
+print("--- FASE 1: ENTRENANDO EL MODELO ---")
+datos = []
+# Entrenamos con 300 días para que la IA sea "sabia"
+for _ in range(300):
+    h = np.arange(24)
+    # Escenarios variados para que la red aprenda a cargar y descargar
+    d = 30 + 20 * np.sin(2 * np.pi * h/24) + np.random.normal(0, 5, 24)
+    r = 20 + 30 * np.random.rand() * np.exp(-((h-12)**2)/6)
     
-    for h in range(24):
-        datos_historicos.append({
-            'demanda': d[h],
-            'renovable': r[h],
-            'soc_anterior': soc_opt[h-1] if h > 0 else SOC_INICIAL,
-            'target_soc': soc_opt[h]
-        })
+    soc_ref = optimizador_maestro(d, r, SOC_INICIAL)
+    for i in range(24):
+        datos.append([d[i], r[i], soc_ref[i-1] if i > 0 else SOC_INICIAL, soc_ref[i]])
 
-df = pd.DataFrame(datos_historicos)
+df_train = pd.DataFrame(datos, columns=['dem', 'ren', 'soc_ant', 'target'])
+scaler = MinMaxScaler()
+X = scaler.fit_transform(df_train[['dem', 'ren', 'soc_ant']])
+y = df_train['target']
 
-# Preparar IA
-scaler = StandardScaler()
-X = scaler.fit_transform(df[['demanda', 'renovable', 'soc_anterior']])
-y = df['target_soc']
-
-# Configurar y entrenar la Red Neuronal
-modelo_ia = MLPRegressor(hidden_layer_sizes=(100, 50), max_iter=1000, random_state=42)
-modelo_ia.fit(X, y)
+# Red neuronal más profunda para evitar que la gráfica salga plana
+modelo_vpp = MLPRegressor(hidden_layer_sizes=(100, 100, 50), activation='tanh', 
+                          max_iter=2000, random_state=1)
+modelo_vpp.fit(X, y)
+print("¡Entrenamiento finalizado!")
 
 # ==========================================
-# 4. SIMULACIÓN DE 1 SEMANA (7 DÍAS)
+# 3. SIMULACIÓN SEMANAL (7 DÍAS = 168 HORAS)
 # ==========================================
-print("\nSimulando comportamiento para 1 semana...")
-dias_simulacion = 7
+print("\n--- FASE 2: SIMULACIÓN DE 7 DÍAS ---")
+warnings.filterwarnings("ignore")
 soc_actual = SOC_INICIAL
-resultados_sim = []
+historial = []
 
-for h_total in range(24 * dias_simulacion):
-    # Escenario aleatorio para la hora actual
-    dem_h = np.random.normal(65, 12)
-    ren_h = np.random.normal(35, 18)
+for h in range(168): # 7 días
     
-    # Predicción de la IA
+    # -------------------------------------------------------
+    # ESPACIO PARA MODIFICAR DATOS DE ENTRADA
+    # -------------------------------------------------------
+    # Aquí puedes cambiar las fórmulas para probar escenarios:
+    
+    # Ejemplo: Pico de demanda tarde y noche
+    dem_h = 35 + 15 * np.sin(2 * np.pi * (h % 24 - 10) / 24) 
+    
+    # Ejemplo: Generación solar (puedes poner 0 para probar la noche)
+    ren_h = 40 * np.exp(-((h % 24 - 12)**2) / 8) 
+    if ren_h < 1: ren_h = 0 # Forzamos cero fuera de horas de sol
+    
+    # -------------------------------------------------------
+    
+    # Ejecución de la Red Neuronal
     input_ia = scaler.transform([[dem_h, ren_h, soc_actual]])
-    nuevo_soc = modelo_ia.predict(input_ia)[0]
+    nuevo_soc = modelo_vpp.predict(input_ia)[0]
     
-    # Asegurar límites físicos por seguridad (Post-procesado)
+    # Filtro de seguridad física
     nuevo_soc = max(0, min(CAPACIDAD_MAX, nuevo_soc))
     
-    resultados_sim.append({
-        'Hora': h_total,
-        'Demanda': dem_h,
-        'Renovable': ren_h,
-        'SOC': nuevo_soc
+    # Cálculo de potencia de la batería (Acción)
+    accion = nuevo_soc - soc_actual
+    
+    historial.append({
+        'Hora': h,
+        'Día': (h // 24) + 1,
+        'Demanda': round(dem_h, 2),
+        'Renovable': round(ren_h, 2),
+        'SOC_Batería': round(nuevo_soc, 2),
+        'Acción_MW': round(accion, 2)
     })
     soc_actual = nuevo_soc
 
-# ==========================================
-# 5. VISUALIZACIÓN DE RESULTADOS
-# ==========================================
-res_df = pd.DataFrame(resultados_sim)
+# Convertir a tabla para ver los valores
+df_res = pd.DataFrame(historial)
 
-plt.figure(figsize=(15, 6))
-plt.plot(res_df['Hora'], res_df['SOC'], label='Nivel Almacenamiento (SOC)', color='blue')
-plt.bar(res_df['Hora'], res_df['Demanda'] - res_df['Renovable'], alpha=0.3, label='Demanda Neta', color='orange')
-plt.axhline(y=CAPACIDAD_MAX, color='r', linestyle='--', label='Capacidad Máxima')
-plt.axhline(y=0, color='black', linestyle='--')
-plt.title('Simulación Semanal: Gestión de Almacenamiento mediante Red Neuronal')
-plt.xlabel('Horas de la semana')
-plt.ylabel('Energía (MWh)')
-plt.legend()
-plt.grid(True, alpha=0.3)
+# ==========================================
+# 4. SALIDA DE VALORES Y GRÁFICAS
+# ==========================================
+
+# Mostramos los primeros 2 días en la terminal para inspección
+print("\nPrimeras 48 horas de operación:")
+print(df_res[['Hora', 'Demanda', 'Renovable', 'SOC_Batería', 'Acción_MW']].head(48).to_string(index=False))
+
+# Gráfica estructurada
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
+
+# Gráfica de Potencias
+ax1.fill_between(df_res['Hora'], df_res['Demanda'], color='red', alpha=0.2, label='Demanda (Consumo)')
+ax1.fill_between(df_res['Hora'], df_res['Renovable'], color='green', alpha=0.2, label='Renovable (Producción)')
+ax1.set_ylabel('MW')
+ax1.set_title('Entradas del Sistema (7 Días)')
+ax1.legend(loc='upper right')
+ax1.grid(alpha=0.3)
+
+# Gráfica del Storage (SOC) y Acción
+ax2.plot(df_res['Hora'], df_res['SOC_Batería'], color='blue', linewidth=2, label='Nivel de Batería (SOC)')
+ax2.bar(df_res['Hora'], df_res['Acción_MW'], color='purple', alpha=0.5, label='Carga (+) / Descarga (-)')
+ax2.axhline(y=CAPACIDAD_MAX, color='black', linestyle='--', label='Límite Max')
+ax2.axhline(y=0, color='black', linestyle='--', label='Límite Min')
+ax2.set_ylabel('MWh / MW')
+ax2.set_xlabel('Horas de la semana')
+ax2.set_title('Respuesta de la Red Neuronal (Gestión de Almacenamiento)')
+ax2.legend(loc='upper right')
+ax2.grid(alpha=0.3)
+
+plt.tight_layout()
 plt.show()
