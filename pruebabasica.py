@@ -129,6 +129,8 @@ ax2.grid(True, alpha=0.3)
 plt.xticks(np.arange(0, 169, 24))
 plt.tight_layout()
 plt.show()
+plt.savefig('resultado_vpp.png', dpi=300, bbox_inches='tight')
+plt.savefig('resultado_vpp.pdf')
 
 # Resumen numérico para validar
 print("\nResumen de gestion (Dia 1):")
