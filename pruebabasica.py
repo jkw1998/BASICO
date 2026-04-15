@@ -61,7 +61,7 @@ soc_actual = SOC_INICIAL
 resultados = []
 
 for h in range(168):
-    # --- ENTRADAS DINÁMICAS (Aquí puedes modificar para testear) ---
+    # --- ENTRADAS DINÁMICAS 
     # Demanda con pico a las 19:00 (h%24 == 19)
     dem_h = 25 + 12 * np.sin(2 * np.pi * (h % 24 - 10) / 24)
     
